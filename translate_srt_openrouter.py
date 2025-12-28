@@ -22,6 +22,7 @@ import os
 import re
 import sys
 import time
+import concurrent.futures
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -102,6 +103,11 @@ Rules:
 TAG_RE = re.compile(r"<[^>]+>")
 LEADING_TAGS_RE = re.compile(r"^\s*(?:<[^>]+>\s*)+")
 SPEAKER_RE = re.compile(r"^([A-Z][A-Z0-9 .'\-]{0,40}):")
+CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+SEGMENT_PAIR_RE = re.compile(
+    r'"id"\s*:\s*(?:"([^"]+)"|(\d+))\s*,\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"',
+    re.DOTALL,
+)
 
 
 @dataclass
@@ -208,16 +214,84 @@ def chunk_by_chars(items: List[Dict[str, object]], max_chars: int) -> Iterable[L
         yield chunk
 
 
-def safe_json_loads(s: str) -> dict:
+def extract_first_json_object(s: str) -> Optional[str]:
+    start = s.find("{")
+    if start < 0:
+        return None
+
+    in_str = False
+    escape = False
+    depth = 0
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+
+        if ch == '"':
+            in_str = True
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start:i + 1]
+
+    return None
+
+
+def sanitize_json_text(s: str) -> str:
     s = s.strip()
+    if s.startswith("```"):
+        s = CODE_FENCE_RE.sub("", s).strip()
+    return s
+
+
+def repair_json_text(s: str) -> str:
+    # Remove trailing commas before closing braces/brackets.
+    return re.sub(r",(\s*[}\]])", r"\1", s)
+
+
+def safe_json_loads(s: str) -> dict:
+    s = sanitize_json_text(s)
+    first_err: Optional[Exception] = None
     try:
         return json.loads(s)
+    except json.JSONDecodeError as err:
+        first_err = err
+
+    candidate = extract_first_json_object(s)
+    if not candidate:
+        if first_err is not None:
+            raise first_err
+        raise json.JSONDecodeError("No JSON object found", s, 0)
+    try:
+        return json.loads(candidate)
     except json.JSONDecodeError:
-        pass
-    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
-    if not m:
-        raise
-    return json.loads(m.group(0))
+        repaired = repair_json_text(candidate)
+        return json.loads(repaired)
+
+
+def extract_segments_best_effort(content: str) -> Dict[str, str]:
+    # Best-effort parse of id/text pairs from malformed JSON.
+    out: Dict[str, str] = {}
+    for m in SEGMENT_PAIR_RE.finditer(content):
+        sid = m.group(1) or m.group(2) or ""
+        raw_text = m.group(3) or ""
+        if not sid:
+            continue
+        try:
+            text = json.loads(f'"{raw_text}"')
+        except json.JSONDecodeError:
+            text = raw_text.replace('\\"', '"').replace("\\n", "\n")
+        out[str(sid)] = text
+    return out
 
 
 def openrouter_chat(
@@ -269,6 +343,8 @@ def translate_batch(
     app_title: str,
     response_format: Optional[dict],
     attempts: int,
+    progress_label: str,
+    progress_state: Optional[Dict[str, object]],
 ) -> Dict[str, str]:
     target_name = TARGET_LANG_NAMES.get(target_lang, target_lang)
     req_obj = {"target_language": target_lang, "segments": batch}
@@ -280,6 +356,7 @@ def translate_batch(
     last_err: Optional[Exception] = None
     for attempt in range(attempts):
         try:
+            print(f"{progress_label}: request attempt {attempt + 1}/{attempts}...", flush=True)
             resp = openrouter_chat(
                 api_key=api_key,
                 model=model,
@@ -292,15 +369,36 @@ def translate_batch(
                 response_format=response_format,
             )
             content = resp["choices"][0]["message"]["content"]
-            obj = safe_json_loads(content)
-            segs = obj.get("segments", [])
-            out: Dict[str, str] = {}
-            for s in segs:
-                sid = str(s.get("id"))
-                out[sid] = s.get("text", "")
-            return out
+            try:
+                obj = safe_json_loads(content)
+                segs = obj.get("segments", [])
+                out: Dict[str, str] = {}
+                for s in segs:
+                    sid = str(s.get("id"))
+                    out[sid] = s.get("text", "")
+                return out
+            except json.JSONDecodeError as e:
+                best = extract_segments_best_effort(content or "")
+                if best:
+                    print(
+                        f"{progress_label}: warning: response JSON malformed; salvaged {len(best)} segments",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return best
+                snippet = (content or "").replace("\n", " ")[:160]
+                raise json.JSONDecodeError(
+                    f"{e.msg} (content_len={len(content or '')}, snippet={snippet!r})",
+                    e.doc,
+                    e.pos,
+                ) from e
+        except json.JSONDecodeError as e:
+            # JSON parse errors usually mean truncated/invalid model output; split batch instead of retrying.
+            print(f"{progress_label}: attempt {attempt + 1} failed: {e}", file=sys.stderr, flush=True)
+            raise
         except Exception as e:
             last_err = e
+            print(f"{progress_label}: attempt {attempt + 1} failed: {e}", file=sys.stderr, flush=True)
             time.sleep(min(10.0, 0.8 * (2 ** attempt)))
 
     raise last_err or RuntimeError("translation failed")
@@ -319,27 +417,108 @@ def translate_items_recursive(
     app_title: str,
     response_format: Optional[dict],
     attempts: int,
+    progress_label: str,
+    depth: int = 0,
+    progress_state: Optional[Dict[str, object]] = None,
 ) -> Dict[str, str]:
     if not items:
         return {}
 
-    got = translate_batch(
-        api_key=api_key,
-        model=model,
-        target_lang=target_lang,
-        batch=items,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        timeout_s=timeout_s,
-        app_url=app_url,
-        app_title=app_title,
-        response_format=response_format,
-        attempts=attempts,
-    )
+    if progress_state is None:
+        progress_state = {}
+
+    try:
+        got = translate_batch(
+            api_key=api_key,
+            model=model,
+            target_lang=target_lang,
+            batch=items,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_s=timeout_s,
+            app_url=app_url,
+            app_title=app_title,
+            response_format=response_format,
+            attempts=attempts,
+            progress_label=progress_label,
+            progress_state=progress_state,
+        )
+    except json.JSONDecodeError:
+        if len(items) == 1:
+            raise
+        if not progress_state.get("split_explain_printed"):
+            print(
+                f"{progress_label}: response JSON invalid; splitting batch into smaller requests",
+                file=sys.stderr,
+                flush=True,
+            )
+            progress_state["split_explain_printed"] = True
+        mid = len(items) // 2
+        left = translate_items_recursive(
+            api_key=api_key, model=model, target_lang=target_lang, items=items[:mid],
+            temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s,
+            app_url=app_url, app_title=app_title, response_format=response_format, attempts=attempts,
+            progress_label=f"{progress_label} [split L]",
+            depth=depth + 1,
+            progress_state=progress_state,
+        )
+        right = translate_items_recursive(
+            api_key=api_key, model=model, target_lang=target_lang, items=items[mid:],
+            temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s,
+            app_url=app_url, app_title=app_title, response_format=response_format, attempts=attempts,
+            progress_label=f"{progress_label} [split R]",
+            depth=depth + 1,
+            progress_state=progress_state,
+        )
+        left.update(right)
+        return left
 
     want_ids = {str(it["id"]) for it in items}
     got_ids = set(got.keys())
     if want_ids.issubset(got_ids) and all(got.get(i, "") != "" for i in want_ids):
+        return got
+
+    if got and got_ids:
+        missing = [it for it in items if str(it["id"]) not in got_ids or not got.get(str(it["id"]), "")]
+        if missing:
+            missing_ids = [str(it["id"]) for it in missing]
+            sample = ", ".join(missing_ids[:5])
+            total = len(items)
+            got_count = len(got_ids)
+            if not progress_state.get("missing_explain_printed"):
+                print(
+                    f"{progress_label}: model did not return all requested segments; "
+                    f"we re-request only the missing segment ids (ids are SRT block numbers)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                progress_state["missing_explain_printed"] = True
+            print(
+                f"{progress_label}: requested {total} segments, got {got_count}, "
+                f"missing {len(missing_ids)} (e.g. ids {sample})",
+                file=sys.stderr,
+                flush=True,
+            )
+            rest = translate_items_recursive(
+                api_key=api_key,
+                model=model,
+                target_lang=target_lang,
+                items=missing,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout_s=timeout_s,
+                app_url=app_url,
+                app_title=app_title,
+                response_format=response_format,
+                attempts=attempts,
+                progress_label=(
+                    f"{progress_label} [retry depth={depth + 1} "
+                    f"missing {len(missing)}/{len(items)}]"
+                ),
+                depth=depth + 1,
+                progress_state=progress_state,
+            )
+            got.update(rest)
         return got
 
     if len(items) == 1:
@@ -350,12 +529,18 @@ def translate_items_recursive(
     left = translate_items_recursive(
         api_key=api_key, model=model, target_lang=target_lang, items=items[:mid],
         temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s,
-        app_url=app_url, app_title=app_title, response_format=response_format, attempts=attempts
+        app_url=app_url, app_title=app_title, response_format=response_format, attempts=attempts,
+        progress_label=f"{progress_label} [split L]",
+        depth=depth + 1,
+        progress_state=progress_state,
     )
     right = translate_items_recursive(
         api_key=api_key, model=model, target_lang=target_lang, items=items[mid:],
         temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s,
-        app_url=app_url, app_title=app_title, response_format=response_format, attempts=attempts
+        app_url=app_url, app_title=app_title, response_format=response_format, attempts=attempts,
+        progress_label=f"{progress_label} [split R]",
+        depth=depth + 1,
+        progress_state=progress_state,
     )
     left.update(right)
     return left
@@ -394,6 +579,20 @@ def build_items_with_context(
     return items
 
 
+def build_items_map_with_context(
+    segments: List[Segment],
+    *,
+    strip_translator_tag: bool,
+    context_window: int,
+) -> Dict[str, Dict[str, object]]:
+    items = build_items_with_context(
+        segments,
+        strip_translator_tag=strip_translator_tag,
+        context_window=context_window,
+    )
+    return {str(it["id"]): it for it in items}
+
+
 def apply_translations(
     segments: List[Segment],
     translated: Dict[str, str],
@@ -416,6 +615,75 @@ def apply_translations(
     return out
 
 
+def load_progress(path: Path) -> Dict[str, str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(data, dict) and isinstance(data.get("translated"), dict):
+        return {str(k): str(v) for k, v in data["translated"].items()}
+    if isinstance(data, dict):
+        return {str(k): str(v) for k, v in data.items()}
+    return {}
+
+
+def save_progress(path: Path, translated: Dict[str, str]) -> None:
+    payload = {"translated": translated}
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def force_linebreaks(text: str, target_lines: int) -> str:
+    if target_lines <= 1:
+        return " ".join(text.splitlines()).strip()
+    plain = " ".join(text.splitlines()).strip()
+    if not plain:
+        return text
+    total_len = len(plain)
+    chunk = max(1, total_len // target_lines)
+    lines: List[str] = []
+    idx = 0
+    for i in range(target_lines - 1):
+        cut = min(total_len, idx + chunk)
+        # Try to cut on a nearby space to avoid mid-word splits.
+        lo = max(idx + 1, cut - 10)
+        hi = min(total_len, cut + 10)
+        space = plain.rfind(" ", lo, hi)
+        if space == -1:
+            space = cut
+        lines.append(plain[idx:space].strip())
+        idx = space + 1 if space < total_len else total_len
+    lines.append(plain[idx:].strip())
+    return "\n".join(line for line in lines if line != "")
+
+
+def apply_translations_with_linebreaks(
+    segments: List[Segment],
+    translated: Dict[str, str],
+    strip_translator_tag: bool,
+    enforce_ids: set[str],
+) -> List[Segment]:
+    out: List[Segment] = []
+    for s in segments:
+        if not s.timestamp:
+            out.append(s)
+            continue
+
+        key = str(s.num)
+        orig_lines = normalize_lines(s.lines, strip_translator_tag)
+
+        if key in translated:
+            text = str(translated[key])
+            if key in enforce_ids:
+                text = force_linebreaks(text, max(1, len(orig_lines)))
+            new_lines = text.split("\n")
+            out.append(Segment(num=s.num, timestamp=s.timestamp, lines=new_lines))
+        else:
+            out.append(Segment(num=s.num, timestamp=s.timestamp, lines=orig_lines))
+    return out
+
+
 def iter_input_files(inputs: List[str], recursive: bool) -> List[Path]:
     paths = [Path(p).expanduser() for p in inputs]
     files: List[Path] = []
@@ -428,6 +696,32 @@ def iter_input_files(inputs: List[str], recursive: bool) -> List[Path]:
             raise FileNotFoundError(str(p))
     uniq: Dict[str, Path] = {str(f.resolve()): f for f in files}
     return list(uniq.values())
+
+
+def is_english_srt(path: Path) -> bool:
+    name = path.name.lower()
+    return name.endswith(".srt") and (".en." in name or name.endswith(".en.srt"))
+
+
+def pick_english_srt(dir_path: Path) -> List[Path]:
+    all_srts = sorted(dir_path.glob("*.srt"))
+    en = [p for p in all_srts if is_english_srt(p)]
+    return en
+
+
+def resolve_tmdb_input(tmdb_id: str, movies_root: Path) -> List[Path]:
+    if not tmdb_id.isdigit():
+        raise FileNotFoundError(tmdb_id)
+    tag = f"{{tmdb-{tmdb_id}}}"
+    candidates = [p for p in movies_root.glob(f"*{tag}*") if p.is_dir()]
+    if not candidates:
+        raise FileNotFoundError(f"No directory with {tag} under {movies_root}")
+    # Prefer exact match if multiple, otherwise first.
+    target_dir = sorted(candidates)[0]
+    en = pick_english_srt(target_dir)
+    if not en:
+        raise FileNotFoundError(f"No English .srt found in {target_dir}")
+    return en
 
 
 def extract_tags(text: str) -> List[str]:
@@ -562,7 +856,15 @@ def qc_judge_batch(
                 response_format=response_format,
             )
             content = resp["choices"][0]["message"]["content"]
-            obj = safe_json_loads(content)
+            try:
+                obj = safe_json_loads(content)
+            except json.JSONDecodeError as e:
+                snippet = (content or "").replace("\n", " ")[:160]
+                raise json.JSONDecodeError(
+                    f"{e.msg} (content_len={len(content or '')}, snippet={snippet!r})",
+                    e.doc,
+                    e.pos,
+                ) from e
             segs = obj.get("segments", [])
             out: Dict[str, Dict[str, object]] = {}
             for s in segs:
@@ -696,7 +998,8 @@ def run_llm_qc(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Translate .srt subtitles using OpenRouter (+ context + validation/QC).")
-    ap.add_argument("inputs", nargs="+", help="Input .srt file(s) or directories")
+    ap.add_argument("inputs", nargs="+",
+                    help="Input .srt file(s), directories, or a tmdb id (e.g. 1197137)")
     ap.add_argument("-t", "--target-lang", default="th", help="Target language code (default: th)")
 
     ap.add_argument("--model", default=os.getenv("OPENROUTER_MODEL", "google/gemini-3-flash-preview"),
@@ -707,30 +1010,51 @@ def main() -> int:
     ap.add_argument("--api-key", default=os.getenv("OPENROUTER_API_KEY"),
                     help="OpenRouter API key (or env OPENROUTER_API_KEY)")
 
-    ap.add_argument("--max-chars", type=int, default=8000, help="Max approx characters per request (default: 8000)")
-    ap.add_argument("--max-tokens", type=int, default=4096, help="max_tokens for translation output (default: 4096)")
+    ap.add_argument("--max-chars", type=int, default=2000, help="Max approx characters per request (default: 2000)")
+    ap.add_argument("--max-tokens", type=int, default=1024, help="max_tokens for translation output (default: 1024)")
     ap.add_argument("--qc-max-tokens", type=int, default=4096, help="max_tokens for QC output (default: 4096)")
 
     ap.add_argument("--temperature", type=float, default=0.0, help="Translation temperature (default: 0.0)")
     ap.add_argument("--qc-temperature", type=float, default=0.0, help="QC temperature (default: 0.0)")
     ap.add_argument("--timeout", type=int, default=120, help="HTTP timeout seconds (default: 120)")
     ap.add_argument("--overwrite", action="store_true", help="Overwrite output file if it exists")
+    ap.add_argument("--overwrite-translated", action="store_true",
+                    help="Overwrite existing translated .srt (alias for --overwrite)")
     ap.add_argument("--recursive", action="store_true", help="If an input is a directory, recurse into subdirs")
-    ap.add_argument("--strip-translator-tag", action="store_true",
-                    help="Remove lines like '# Subtitles translated with ... #' before translating")
+    ap.add_argument("--strip-translator-tag", action="store_true", default=True,
+                    help="Remove lines like '# Subtitles translated with ... #' before translating (default: on)")
+    ap.add_argument("--no-strip-translator-tag", dest="strip_translator_tag", action="store_false",
+                    help="Do not strip translator tag lines")
 
-    ap.add_argument("--context-window", type=int, default=2,
-                    help="Include N previous/next segments as context for each segment (default: 2)")
-    ap.add_argument("--validate", action="store_true", help="Run heuristic validation after translation")
+    ap.add_argument("--context-window", type=int, default=0,
+                    help="Include N previous/next segments as context for each segment (default: 0)")
+    ap.add_argument("--validate", action="store_true", default=True,
+                    help="Run heuristic validation after translation (default: on)")
+    ap.add_argument("--no-validate", dest="validate", action="store_false",
+                    help="Disable heuristic validation")
     ap.add_argument("--llm-qc", action="store_true", help="Run judge-model QC and emit report JSON")
     ap.add_argument("--qc-limit", type=int, default=250,
                     help="How many segments to QC (0 = all). Default: 250. Prioritizes flagged segments first.")
+    ap.add_argument("--auto-fix", action="store_true", default=True,
+                    help="Auto-fix flagged segments (retranslate + linebreak enforcement) (default: on)")
+    ap.add_argument("--no-auto-fix", dest="auto_fix", action="store_false",
+                    help="Disable auto-fix")
+    ap.add_argument("--resume", action="store_true", default=True,
+                    help="Resume from saved progress file to avoid re-translating (default: on)")
+    ap.add_argument("--no-resume", dest="resume", action="store_false",
+                    help="Disable resume/progress caching")
 
     ap.add_argument("--app-url", default=os.getenv("OPENROUTER_APP_URL", ""), help="Optional HTTP-Referer header value")
     ap.add_argument("--app-title", default=os.getenv("OPENROUTER_APP_TITLE", "srt-translator"), help="Optional X-Title header value")
-    ap.add_argument("--json-mode", action="store_true",
-                    help="Send response_format={type:'json_object'} (recommended for reliable parsing)")
+    ap.add_argument("--json-mode", action="store_true", default=True,
+                    help="Send response_format={type:'json_object'} (default: on)")
+    ap.add_argument("--no-json-mode", dest="json_mode", action="store_false",
+                    help="Disable response_format json_object")
     ap.add_argument("--attempts", type=int, default=5, help="Retry attempts per request (default: 5)")
+    ap.add_argument("--parallel", type=int, default=4,
+                    help="Parallel batch requests (default: 4)")
+    ap.add_argument("--movies-root", default="/home/h2/media/Movies",
+                    help="Root folder to search when input is a tmdb id (default: /home/h2/media/Movies)")
 
     args = ap.parse_args()
 
@@ -738,7 +1062,22 @@ def main() -> int:
         print("Missing API key. Set OPENROUTER_API_KEY or pass --api-key.", file=sys.stderr)
         return 2
 
-    in_files = iter_input_files(args.inputs, recursive=args.recursive)
+    argv = set(sys.argv[1:])
+    if args.model == "openai/gpt-4o-mini":
+        if "--max-chars" not in argv:
+            args.max_chars = max(args.max_chars, 4000)
+        if "--max-tokens" not in argv:
+            args.max_tokens = max(args.max_tokens, 1536)
+
+    inputs: List[str] = []
+    movies_root = Path(args.movies_root).expanduser()
+    for raw in args.inputs:
+        if raw.isdigit():
+            inputs.extend(str(p) for p in resolve_tmdb_input(raw, movies_root))
+        else:
+            inputs.append(raw)
+
+    in_files = iter_input_files(inputs, recursive=args.recursive)
     if not in_files:
         print("No .srt files found.", file=sys.stderr)
         return 1
@@ -749,42 +1088,109 @@ def main() -> int:
         out_name = swap_lang_in_filename(in_path.name, args.target_lang)
         out_path = in_path.with_name(out_name)
 
-        if out_path.exists() and not args.overwrite:
+        if out_path.exists() and not (args.overwrite or args.overwrite_translated):
             print(f"SKIP exists: {out_path}")
             continue
 
         src_text = read_text_with_fallback(in_path)
         src_segments = parse_srt(src_text)
 
-        items = build_items_with_context(
+        items_full = build_items_with_context(
             src_segments,
             strip_translator_tag=args.strip_translator_tag,
             context_window=max(0, args.context_window),
         )
 
+        progress_path = out_path.with_suffix(out_path.suffix + ".progress.json")
         translated_all: Dict[str, str] = {}
+        if args.resume and progress_path.exists():
+            translated_all = load_progress(progress_path)
+            if translated_all:
+                print(f"RESUME: loaded {len(translated_all)} segments from {progress_path}")
+
+        items = [it for it in items_full if str(it["id"]) not in translated_all or not translated_all.get(str(it["id"]))] 
+        if not items:
+            print(f"SKIP all translated: {in_path.name}")
+        else:
+            print(f"{in_path.name}: remaining {len(items)}/{len(items_full)} segments")
+
         batches = list(chunk_by_chars(items, max_chars=args.max_chars))
-        for bi, batch in enumerate(batches, start=1):
-            translated = translate_items_recursive(
-                api_key=args.api_key,
-                model=args.model,
-                target_lang=args.target_lang,
-                items=batch,
-                temperature=args.temperature,
-                max_tokens=args.max_tokens,
-                timeout_s=args.timeout,
-                app_url=args.app_url,
-                app_title=args.app_title,
-                response_format=response_format,
-                attempts=args.attempts,
-            )
-            translated_all.update(translated)
-            print(f"{in_path.name}: batch {bi}/{len(batches)} done, total {len(translated_all)}/{len(items)}")
+        total_batches = len(batches)
+        parallel = max(1, args.parallel)
+        print(
+            f"{in_path.name}: translate {len(items_full)} segments, "
+            f"{total_batches} batches, parallel={parallel}"
+        )
+        print(
+            f"{in_path.name}: a segment = one subtitle block; ids are the SRT numbers; "
+            f"batches group multiple segments per request"
+        )
+        if parallel > 1:
+            print(f"{in_path.name}: note: batch completion logs may appear out of order (parallel)")
+
+        progress_state: Dict[str, object] = {}
+        if parallel == 1:
+            for bi, batch in enumerate(batches, start=1):
+                progress_label = f"{in_path.name}: batch {bi}/{total_batches}"
+                translated = translate_items_recursive(
+                    api_key=args.api_key,
+                    model=args.model,
+                    target_lang=args.target_lang,
+                    items=batch,
+                    temperature=args.temperature,
+                    max_tokens=args.max_tokens,
+                    timeout_s=args.timeout,
+                    app_url=args.app_url,
+                    app_title=args.app_title,
+                    response_format=response_format,
+                    attempts=args.attempts,
+                    progress_label=progress_label,
+                    progress_state=progress_state,
+                )
+                translated_all.update(translated)
+                if args.resume:
+                    save_progress(progress_path, translated_all)
+                print(f"{in_path.name}: batch {bi}/{total_batches} done, total {len(translated_all)}/{len(items)}")
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as ex:
+                futures: Dict[concurrent.futures.Future[Dict[str, str]], int] = {}
+                for bi, batch in enumerate(batches, start=1):
+                    progress_label = f"{in_path.name}: batch {bi}/{total_batches}"
+                    fut = ex.submit(
+                        translate_items_recursive,
+                        api_key=args.api_key,
+                        model=args.model,
+                        target_lang=args.target_lang,
+                        items=batch,
+                        temperature=args.temperature,
+                        max_tokens=args.max_tokens,
+                        timeout_s=args.timeout,
+                        app_url=args.app_url,
+                        app_title=args.app_title,
+                        response_format=response_format,
+                        attempts=args.attempts,
+                        progress_label=progress_label,
+                        progress_state=progress_state,
+                    )
+                    futures[fut] = bi
+
+                for fut in concurrent.futures.as_completed(futures):
+                    bi = futures[fut]
+                    translated = fut.result()
+                    translated_all.update(translated)
+                    if args.resume:
+                        save_progress(progress_path, translated_all)
+                    print(
+                        f"{in_path.name}: batch {bi}/{total_batches} done, "
+                        f"total {len(translated_all)}/{len(items)}"
+                    )
 
         out_segments = apply_translations(src_segments, translated_all, strip_translator_tag=args.strip_translator_tag)
         out_text = format_srt(out_segments)
         out_path.write_text(out_text, encoding="utf-8")
         print(f"WROTE: {out_path}")
+        if args.resume:
+            save_progress(progress_path, translated_all)
 
         heur = None
         flagged_ids: List[str] = []
@@ -799,12 +1205,97 @@ def main() -> int:
             for it in heur["issues"]:
                 if isinstance(it, dict) and "id" in it:
                     flagged_ids.append(str(it["id"]))
+                if isinstance(it, dict) and it.get("type") == "missing_model_outputs":
+                    for sid in it.get("ids", []):
+                        flagged_ids.append(str(sid))
 
         if args.validate and heur is not None:
             print(f"VALIDATE: ok={heur['ok']} total={heur['total_segments']} expected_translations={heur['expected_translations']}")
             if not heur["ok"]:
+                type_counts: Dict[str, int] = {}
+                for it in heur["issues"]:
+                    if isinstance(it, dict):
+                        t = str(it.get("type", "unknown"))
+                        type_counts[t] = type_counts.get(t, 0) + 1
+                if type_counts:
+                    top = sorted(type_counts.items(), key=lambda x: (-x[1], x[0]))[:6]
+                    top_str = ", ".join(f"{k}={v}" for k, v in top)
+                    print(f"  SUMMARY: {top_str}")
                 for it in heur["issues"][:25]:
                     print("  ISSUE:", it)
+
+        if args.auto_fix and heur is not None and flagged_ids:
+            unique_ids = sorted(set(flagged_ids), key=lambda x: int(x))
+            sample = ", ".join(unique_ids[:8])
+            print(f"AUTO-FIX: retranslate {len(unique_ids)} segments (e.g. {sample})")
+            items_map = build_items_map_with_context(
+                src_segments,
+                strip_translator_tag=args.strip_translator_tag,
+                context_window=max(0, args.context_window),
+            )
+            fix_items = [items_map[sid] for sid in unique_ids if sid in items_map]
+            if fix_items:
+                fix_max_chars = min(args.max_chars, 2000)
+                fix_max_tokens = min(args.max_tokens, 1024)
+                fix_batches = list(chunk_by_chars(fix_items, max_chars=fix_max_chars))
+                for bi, batch in enumerate(fix_batches, start=1):
+                    progress_label = f"{in_path.name}: autofix batch {bi}/{len(fix_batches)}"
+                    fixed = translate_items_recursive(
+                        api_key=args.api_key,
+                        model=args.model,
+                        target_lang=args.target_lang,
+                        items=batch,
+                        temperature=args.temperature,
+                        max_tokens=fix_max_tokens,
+                        timeout_s=args.timeout,
+                        app_url=args.app_url,
+                        app_title=args.app_title,
+                        response_format=response_format,
+                        attempts=args.attempts,
+                        progress_label=progress_label,
+                    )
+                    translated_all.update(fixed)
+
+                out_segments = apply_translations_with_linebreaks(
+                    src_segments,
+                    translated_all,
+                    strip_translator_tag=args.strip_translator_tag,
+                    enforce_ids=set(unique_ids),
+                )
+                out_text = format_srt(out_segments)
+                out_path.write_text(out_text, encoding="utf-8")
+                print(f"WROTE: {out_path}")
+
+                if args.resume:
+                    save_progress(progress_path, translated_all)
+                if args.validate:
+                    heur = validate_translation(
+                        original_segments=src_segments,
+                        translated_segments=out_segments,
+                        translated_ids=set(translated_all.keys()),
+                        target_lang=args.target_lang,
+                        strip_translator_tag=args.strip_translator_tag,
+                    )
+                    print(
+                        f"AUTO-FIX VALIDATE: ok={heur['ok']} total={heur['total_segments']} "
+                        f"expected_translations={heur['expected_translations']}"
+                    )
+                    if not heur["ok"]:
+                        type_counts = {}
+                        for it in heur["issues"]:
+                            if isinstance(it, dict):
+                                t = str(it.get("type", "unknown"))
+                                type_counts[t] = type_counts.get(t, 0) + 1
+                        if type_counts:
+                            top = sorted(type_counts.items(), key=lambda x: (-x[1], x[0]))[:6]
+                            top_str = ", ".join(f"{k}={v}" for k, v in top)
+                            print(f"  SUMMARY: {top_str}")
+                        for it in heur["issues"][:25]:
+                            print("  ISSUE:", it)
+
+        if args.resume and progress_path.exists():
+            if args.validate and heur is not None and heur.get("ok"):
+                progress_path.unlink()
 
         if args.llm_qc:
             qc = run_llm_qc(
