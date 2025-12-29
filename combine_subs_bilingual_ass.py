@@ -110,10 +110,54 @@ def srt_to_ass_time(t: str) -> str:
     return f"{int(hh)}:{mm}:{ss}.{cs}"
 
 
+ASS_OVERRIDE_RE = re.compile(r"(\{\\[^}]*\})")
+
+
 def ass_escape(text: str) -> str:
-    text = text.replace("\\", r"\\")
-    text = text.replace("{", r"\{").replace("}", r"\}")
-    text = text.replace("\n", r"\N")
+    parts = ASS_OVERRIDE_RE.split(text)
+    out: List[str] = []
+    for part in parts:
+        if ASS_OVERRIDE_RE.fullmatch(part):
+            out.append(part)
+            continue
+        part = part.replace("\\", r"\\")
+        part = part.replace("{", r"\{").replace("}", r"\}")
+        part = part.replace("\n", r"\N")
+        out.append(part)
+    return "".join(out)
+
+
+def html_to_ass(text: str) -> str:
+    # Basic HTML tag conversion for common subtitle tags.
+    text = re.sub(r"<i>", r"{\\i1}", text, flags=re.IGNORECASE)
+    text = re.sub(r"</i>", r"{\\i0}", text, flags=re.IGNORECASE)
+    text = re.sub(r"<b>", r"{\\b1}", text, flags=re.IGNORECASE)
+    text = re.sub(r"</b>", r"{\\b0}", text, flags=re.IGNORECASE)
+    text = re.sub(r"<u>", r"{\\u1}", text, flags=re.IGNORECASE)
+    text = re.sub(r"</u>", r"{\\u0}", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\s*an([1-9])\s*>", r"{\\an\1}", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\s*\\an([1-9])\s*>", r"{\\an\1}", text, flags=re.IGNORECASE)
+
+    def font_tag_repl(match: re.Match) -> str:
+        attrs = match.group(1) or ""
+        parts: List[str] = []
+        color = re.search(r'color\s*=\s*"(#?[0-9A-Fa-f]{6})"', attrs)
+        if color:
+            hexval = color.group(1).lstrip("#")
+            bb = hexval[4:6]
+            gg = hexval[2:4]
+            rr = hexval[0:2]
+            parts.append(rf"{{\c&H{bb}{gg}{rr}&}}")
+        face = re.search(r'face\s*=\s*"([^"]+)"', attrs)
+        if face:
+            parts.append(rf"{{\fn{face.group(1)}}}")
+        size = re.search(r'size\s*=\s*"(\d+)"', attrs)
+        if size:
+            parts.append(rf"{{\fs{size.group(1)}}}")
+        return "".join(parts)
+
+    text = re.sub(r"<font\s+([^>]*)>", font_tag_repl, text, flags=re.IGNORECASE)
+    text = re.sub(r"</font>", r"{\\r}", text, flags=re.IGNORECASE)
     return text
 
 
@@ -135,16 +179,16 @@ def combine_to_ass(a_segs: List[Segment], b_segs: List[Segment]) -> List[str]:
         start_srt, end_srt = parse_srt_timestamp(s.timestamp)
         start = srt_to_ass_time(start_srt)
         end = srt_to_ass_time(end_srt)
-        a_text = ass_escape("\n".join(s.lines).strip())
-        b_text = ass_escape("\n".join(b.lines).strip())
+        a_text = ass_escape(html_to_ass("\n".join(s.lines).strip()))
+        b_text = ass_escape(html_to_ass("\n".join(b.lines).strip()))
         if a_text:
-            events.append(f"Dialogue: 0,{start},{end},EN,,0,0,0,,{a_text}")
+            events.append(f"Dialogue: 0,{start},{end},A,,0,0,0,,{a_text}")
         if b_text:
-            events.append(f"Dialogue: 0,{start},{end},TH,,0,0,0,,{b_text}")
+            events.append(f"Dialogue: 0,{start},{end},B,,0,0,0,,{b_text}")
     return events
 
 
-def ass_header(play_res_x: int, play_res_y: int, margin_v_en: int, margin_v_th: int) -> str:
+def ass_header(play_res_x: int, play_res_y: int, margin_v_a: int, margin_v_b: int) -> str:
     return f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {play_res_x}
@@ -153,8 +197,8 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: EN,Arial,44,&H00FFFFFF,&H000000FF,&H00111111,&H90000000,0,0,0,0,100,100,0,0,1,2,0,2,40,40,{margin_v_en},1
-Style: TH,Tahoma,42,&H00C8F4FF,&H000000FF,&H00111111,&H90000000,0,0,0,0,100,100,0,0,1,2,0,2,40,40,{margin_v_th},1
+Style: A,Arial,50,&H00FFFFFF,&H000000FF,&H00111111,&H90000000,0,0,0,0,100,100,0,0,1,2,0,2,40,40,{margin_v_a},1
+Style: B,Tahoma,48,&H00C8F4FF,&H000000FF,&H00111111,&H90000000,0,0,0,0,100,100,0,0,1,2,0,2,40,40,{margin_v_b},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -173,8 +217,8 @@ def main() -> int:
     ap.add_argument("-o", "--output", help="Output .ass path (default: <base>.<A>+<B>.ass)")
     ap.add_argument("--playres-x", type=int, default=1920, help="ASS PlayResX (default: 1920)")
     ap.add_argument("--playres-y", type=int, default=1080, help="ASS PlayResY (default: 1080)")
-    ap.add_argument("--margin-en", type=int, default=30, help="Bottom margin for EN (default: 30)")
-    ap.add_argument("--margin-th", type=int, default=80, help="Bottom margin for TH (default: 80)")
+    ap.add_argument("--margin-a", type=int, default=30, help="Bottom margin for primary language (default: 30)")
+    ap.add_argument("--margin-b", type=int, default=80, help="Bottom margin for secondary language (default: 80)")
 
     args = ap.parse_args()
 
@@ -216,7 +260,7 @@ def main() -> int:
         tag = f".{lang_a.upper()}+{lang_b.upper()}.ass"
         out_path = a_path.with_name(base.replace(".srt", tag))
 
-    header = ass_header(args.playres_x, args.playres_y, args.margin_en, args.margin_th)
+    header = ass_header(args.playres_x, args.playres_y, args.margin_a, args.margin_b)
     out_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
     print(f"WROTE: {out_path}")
     return 0
