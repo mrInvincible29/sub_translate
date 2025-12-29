@@ -12,6 +12,37 @@ export OPENROUTER_API_KEY="..."
 python3 translate_srt_openrouter.py 1197137 -t th
 ```
 
+### All flags
+- `-t, --target-lang`: target language code.
+- `--model`: translation model id.
+- `--judge-model`: QC model id (used with `--llm-qc`).
+- `--api-key`: OpenRouter API key override.
+- `--max-chars`: approx input chars per request.
+- `--max-tokens`: output tokens per request.
+- `--qc-max-tokens`: output tokens for QC.
+- `--temperature`: translation temperature.
+- `--qc-temperature`: QC temperature.
+- `--timeout`: HTTP timeout seconds.
+- `--overwrite`, `--overwrite-translated`: overwrite output if exists.
+- `--recursive`: recurse into subfolders when input is a directory.
+- `--strip-translator-tag`, `--no-strip-translator-tag`: remove translator tag lines.
+- `--context-window`: include N previous/next segments as context.
+- `--validate`, `--no-validate`: heuristic validation.
+- `--llm-qc`: run judge model QC and save report JSON.
+- `--qc-limit`: QC segment limit (0 = all).
+- `--auto-fix`, `--no-auto-fix`: auto-fix flagged segments.
+- `--resume`, `--no-resume`: save/load progress file.
+- `--app-url`: HTTP-Referer header for OpenRouter.
+- `--app-title`: X-Title header for OpenRouter.
+- `--json-mode`, `--no-json-mode`: use response_format json_object.
+- `--attempts`: retry attempts per request.
+- `--parallel`: parallel batch requests.
+- `--progress-bar`, `--no-progress-bar`: persistent progress bar.
+- `--verbose`: detailed batch/missing logs.
+- `--adaptive-limits`, `--no-adaptive-limits`: auto-tune limits.
+- `--color`, `--no-color`: colorized logs.
+- `--movies-root`: TMDB lookup root.
+
 ### Inputs
 - Accepts `.srt` file paths, directories, or a TMDB id (e.g. `1197137`).
 - TMDB id searches under `/home/h2/media/Movies` by default.
@@ -50,6 +81,20 @@ Verbose logs:
 python3 translate_srt_openrouter.py 1197137 -t th --verbose
 ```
 
+Use cases:
+- Auto translate a movie folder by TMDB id and resume safely:
+```bash
+python3 translate_srt_openrouter.py 1197137 -t th
+```
+- Overwrite an existing translated file:
+```bash
+python3 translate_srt_openrouter.py 1197137 -t th --overwrite-translated
+```
+- Lower batch sizes for stricter JSON:
+```bash
+python3 translate_srt_openrouter.py 1197137 -t th --max-chars 1500 --max-tokens 768
+```
+
 ## combine_subs_bilingual_ass.py
 
 Creates a single bilingual `.ass` subtitle with two lines per segment:
@@ -77,4 +122,23 @@ python3 combine_subs_bilingual_ass.py whatever \
 Adjust placement:
 ```bash
 python3 combine_subs_bilingual_ass.py 1197137 --margin-a 30 --margin-b 80
+```
+
+### All flags
+- `input`: TMDB id or directory containing subtitle files.
+- `--movies-root`: TMDB lookup root.
+- `--lang-a`, `--lang-b`: primary/secondary language codes.
+- `--a`, `--b`: explicit subtitle file paths.
+- `-o, --output`: output `.ass` path.
+- `--playres-x`, `--playres-y`: ASS resolution.
+- `--margin-a`, `--margin-b`: vertical placement margins.
+
+Use cases:
+- Create EN+TH ASS for Plex TV apps:
+```bash
+python3 combine_subs_bilingual_ass.py 1197137
+```
+- Use a different pair and custom output:
+```bash
+python3 combine_subs_bilingual_ass.py 1197137 --lang-a en --lang-b es -o "/path/Movie.EN+ES.ass"
 ```
