@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Combine two subtitle files into one bilingual .srt (EN first, then TH).
-Optimized for Plex: keeps original timestamps; combines lines per segment.
+Combine two subtitle files into a bilingual ASS subtitle.
+EN on bottom, second language above it. Optimized for Plex TV apps.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 KNOWN_SUFFIX_TAGS = {
     "hi", "sdh", "forced", "cc", "subs", "sub", "dub", "commentary", "chs", "cht"
@@ -49,24 +49,6 @@ def parse_srt(text: str) -> List[Segment]:
         else:
             segs.append(Segment(num=0, timestamp="", lines=lines))
     return segs
-
-
-def format_srt(segments: List[Segment]) -> str:
-    out: List[str] = []
-    need_renumber = any(s.num == 0 or not s.timestamp for s in segments)
-    next_num = 1
-    for s in segments:
-        if s.timestamp:
-            num = next_num if need_renumber else s.num
-            out.append(str(num))
-            out.append(s.timestamp)
-            out.extend(s.lines)
-            out.append("")
-            next_num += 1
-        else:
-            out.extend(s.lines)
-            out.append("")
-    return "\n".join(out).rstrip() + "\n"
 
 
 def is_lang_srt(path: Path, lang: str) -> bool:
@@ -113,7 +95,29 @@ def resolve_tmdb_dir(tmdb_id: str, movies_root: Path) -> Path:
     return sorted(candidates)[0]
 
 
-def combine_segments(a_segs: List[Segment], b_segs: List[Segment]) -> List[Segment]:
+def parse_srt_timestamp(ts: str) -> Tuple[str, str]:
+    parts = ts.split("-->")
+    if len(parts) != 2:
+        raise ValueError(f"Bad timestamp: {ts}")
+    return parts[0].strip(), parts[1].strip()
+
+
+def srt_to_ass_time(t: str) -> str:
+    # "00:01:02,345" -> "0:01:02.34"
+    hh, mm, rest = t.split(":")
+    ss, ms = rest.split(",")
+    cs = str(int(ms) // 10).rjust(2, "0")
+    return f"{int(hh)}:{mm}:{ss}.{cs}"
+
+
+def ass_escape(text: str) -> str:
+    text = text.replace("\\", r"\\")
+    text = text.replace("{", r"\{").replace("}", r"\}")
+    text = text.replace("\n", r"\N")
+    return text
+
+
+def combine_to_ass(a_segs: List[Segment], b_segs: List[Segment]) -> List[str]:
     a_map: Dict[int, Segment] = {s.num: s for s in a_segs if s.timestamp}
     b_map: Dict[int, Segment] = {s.num: s for s in b_segs if s.timestamp}
 
@@ -121,21 +125,44 @@ def combine_segments(a_segs: List[Segment], b_segs: List[Segment]) -> List[Segme
     if missing:
         raise ValueError(f"Segment mismatch; missing ids: {missing[:10]}")
 
-    out: List[Segment] = []
+    events: List[str] = []
     for s in a_segs:
         if not s.timestamp:
-            out.append(s)
             continue
         b = b_map.get(s.num)
         if not b:
             raise ValueError(f"Missing segment id {s.num} in second language")
-        lines = s.lines + [""] + b.lines
-        out.append(Segment(num=s.num, timestamp=s.timestamp, lines=lines))
-    return out
+        start_srt, end_srt = parse_srt_timestamp(s.timestamp)
+        start = srt_to_ass_time(start_srt)
+        end = srt_to_ass_time(end_srt)
+        a_text = ass_escape("\n".join(s.lines).strip())
+        b_text = ass_escape("\n".join(b.lines).strip())
+        if a_text:
+            events.append(f"Dialogue: 0,{start},{end},EN,,0,0,0,,{a_text}")
+        if b_text:
+            events.append(f"Dialogue: 0,{start},{end},TH,,0,0,0,,{b_text}")
+    return events
+
+
+def ass_header(play_res_x: int, play_res_y: int, margin_v_en: int, margin_v_th: int) -> str:
+    return f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {play_res_x}
+PlayResY: {play_res_y}
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: EN,Arial,44,&H00FFFFFF,&H000000FF,&H00111111,&H90000000,0,0,0,0,100,100,0,0,1,2,0,2,40,40,{margin_v_en},1
+Style: TH,Tahoma,42,&H00C8F4FF,&H000000FF,&H00111111,&H90000000,0,0,0,0,100,100,0,0,1,2,0,2,40,40,{margin_v_th},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Combine two subtitle languages into one bilingual .srt.")
+    ap = argparse.ArgumentParser(description="Combine two subtitle languages into one ASS subtitle.")
     ap.add_argument("input", help="tmdb id, or directory containing subtitle files")
     ap.add_argument("--movies-root", default="/home/h2/media/Movies",
                     help="Root folder to search when input is a tmdb id (default: /home/h2/media/Movies)")
@@ -143,7 +170,11 @@ def main() -> int:
     ap.add_argument("--lang-b", default="th", help="Secondary language code (default: th)")
     ap.add_argument("--a", dest="a_path", help="Explicit primary .srt path (overrides search)")
     ap.add_argument("--b", dest="b_path", help="Explicit secondary .srt path (overrides search)")
-    ap.add_argument("-o", "--output", help="Output .srt path (default: <base>.<A>+<B>.srt)")
+    ap.add_argument("-o", "--output", help="Output .ass path (default: <base>.<A>+<B>.ass)")
+    ap.add_argument("--playres-x", type=int, default=1920, help="ASS PlayResX (default: 1920)")
+    ap.add_argument("--playres-y", type=int, default=1080, help="ASS PlayResY (default: 1080)")
+    ap.add_argument("--margin-en", type=int, default=30, help="Bottom margin for EN (default: 30)")
+    ap.add_argument("--margin-th", type=int, default=80, help="Bottom margin for TH (default: 80)")
 
     args = ap.parse_args()
 
@@ -173,7 +204,7 @@ def main() -> int:
     b_segs = parse_srt(b_text)
 
     try:
-        combined = combine_segments(a_segs, b_segs)
+        events = combine_to_ass(a_segs, b_segs)
     except ValueError as e:
         print(f"Combine failed: {e}", file=sys.stderr)
         return 2
@@ -182,10 +213,11 @@ def main() -> int:
         out_path = Path(args.output).expanduser()
     else:
         base = strip_lang_and_tags(a_path.name)
-        tag = f".{lang_a.upper()}+{lang_b.upper()}.srt"
+        tag = f".{lang_a.upper()}+{lang_b.upper()}.ass"
         out_path = a_path.with_name(base.replace(".srt", tag))
 
-    out_path.write_text(format_srt(combined), encoding="utf-8")
+    header = ass_header(args.playres_x, args.playres_y, args.margin_en, args.margin_th)
+    out_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
     print(f"WROTE: {out_path}")
     return 0
 

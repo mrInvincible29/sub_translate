@@ -23,6 +23,7 @@ import re
 import sys
 import time
 import concurrent.futures
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -356,7 +357,8 @@ def translate_batch(
     last_err: Optional[Exception] = None
     for attempt in range(attempts):
         try:
-            print(f"{progress_label}: request attempt {attempt + 1}/{attempts}...", flush=True)
+            if progress_state is None or progress_state.get("verbose"):
+                print(f"{progress_label}: request attempt {attempt + 1}/{attempts}...", flush=True)
             resp = openrouter_chat(
                 api_key=api_key,
                 model=model,
@@ -376,15 +378,23 @@ def translate_batch(
                 for s in segs:
                     sid = str(s.get("id"))
                     out[sid] = s.get("text", "")
+                if progress_state is not None:
+                    progress_state["last_json_error"] = False
+                    progress_state["last_salvaged"] = False
                 return out
             except json.JSONDecodeError as e:
+                if progress_state is not None:
+                    progress_state["last_json_error"] = True
                 best = extract_segments_best_effort(content or "")
                 if best:
-                    print(
-                        f"{progress_label}: warning: response JSON malformed; salvaged {len(best)} segments",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    if progress_state is not None:
+                        progress_state["last_salvaged"] = True
+                    if progress_state is None or progress_state.get("verbose"):
+                        print(
+                            f"{progress_label}: warning: response JSON malformed; salvaged {len(best)} segments",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     return best
                 snippet = (content or "").replace("\n", " ")[:160]
                 raise json.JSONDecodeError(
@@ -427,6 +437,34 @@ def translate_items_recursive(
     if progress_state is None:
         progress_state = {}
 
+    if progress_state.get("adaptive_limits"):
+        cur_max_chars = int(progress_state.get("max_chars", 0) or 0)
+        if cur_max_chars > 0 and len(items) > 1:
+            total_chars = sum(item_size_chars(it) for it in items)
+            if total_chars > cur_max_chars:
+                chunks = list(chunk_by_chars(items, max_chars=cur_max_chars))
+                out: Dict[str, str] = {}
+                for i, chunk in enumerate(chunks, start=1):
+                    sub_label = f"{progress_label} [chunk {i}/{len(chunks)}]"
+                    got = translate_items_recursive(
+                        api_key=api_key,
+                        model=model,
+                        target_lang=target_lang,
+                        items=chunk,
+                        temperature=temperature,
+                        max_tokens=int(progress_state.get("max_tokens", max_tokens) or max_tokens),
+                        timeout_s=timeout_s,
+                        app_url=app_url,
+                        app_title=app_title,
+                        response_format=response_format,
+                        attempts=attempts,
+                        progress_label=sub_label,
+                        depth=depth,
+                        progress_state=progress_state,
+                    )
+                    out.update(got)
+                return out
+
     try:
         got = translate_batch(
             api_key=api_key,
@@ -434,7 +472,7 @@ def translate_items_recursive(
             target_lang=target_lang,
             batch=items,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=int(progress_state.get("max_tokens", max_tokens) or max_tokens),
             timeout_s=timeout_s,
             app_url=app_url,
             app_title=app_title,
@@ -446,13 +484,19 @@ def translate_items_recursive(
     except json.JSONDecodeError:
         if len(items) == 1:
             raise
-        if not progress_state.get("split_explain_printed"):
+        if not progress_state.get("split_explain_printed") and progress_state.get("verbose"):
             print(
                 f"{progress_label}: response JSON invalid; splitting batch into smaller requests",
                 file=sys.stderr,
                 flush=True,
             )
             progress_state["split_explain_printed"] = True
+        adjust_adaptive_limits(
+            progress_state,
+            direction="down",
+            reason="json_error",
+            label=progress_label,
+        )
         mid = len(items) // 2
         left = translate_items_recursive(
             api_key=api_key, model=model, target_lang=target_lang, items=items[:mid],
@@ -476,6 +520,14 @@ def translate_items_recursive(
     want_ids = {str(it["id"]) for it in items}
     got_ids = set(got.keys())
     if want_ids.issubset(got_ids) and all(got.get(i, "") != "" for i in want_ids):
+        if progress_state.get("adaptive_limits"):
+            progress_state["stable_ok"] = int(progress_state.get("stable_ok", 0) or 0) + 1
+            adjust_adaptive_limits(
+                progress_state,
+                direction="up",
+                reason="stable_ok",
+                label=progress_label,
+            )
         return got
 
     if got and got_ids:
@@ -485,7 +537,7 @@ def translate_items_recursive(
             sample = ", ".join(missing_ids[:5])
             total = len(items)
             got_count = len(got_ids)
-            if not progress_state.get("missing_explain_printed"):
+            if not progress_state.get("missing_explain_printed") and progress_state.get("verbose"):
                 print(
                     f"{progress_label}: model did not return all requested segments; "
                     f"we re-request only the missing segment ids (ids are SRT block numbers)",
@@ -493,11 +545,18 @@ def translate_items_recursive(
                     flush=True,
                 )
                 progress_state["missing_explain_printed"] = True
-            print(
-                f"{progress_label}: requested {total} segments, got {got_count}, "
-                f"missing {len(missing_ids)} (e.g. ids {sample})",
-                file=sys.stderr,
-                flush=True,
+            if progress_state.get("verbose"):
+                print(
+                    f"{progress_label}: requested {total} segments, got {got_count}, "
+                    f"missing {len(missing_ids)} (e.g. ids {sample})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            adjust_adaptive_limits(
+                progress_state,
+                direction="down",
+                reason="missing_segments",
+                label=progress_label,
             )
             rest = translate_items_recursive(
                 api_key=api_key,
@@ -519,6 +578,14 @@ def translate_items_recursive(
                 progress_state=progress_state,
             )
             got.update(rest)
+        if progress_state.get("last_salvaged"):
+            adjust_adaptive_limits(
+                progress_state,
+                direction="down",
+                reason="salvaged_json",
+                label=progress_label,
+            )
+            progress_state["last_salvaged"] = False
         return got
 
     if len(items) == 1:
@@ -632,6 +699,80 @@ def load_progress(path: Path) -> Dict[str, str]:
 def save_progress(path: Path, translated: Dict[str, str]) -> None:
     payload = {"translated": translated}
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def render_progress(done: int, total: int, width: int = 30) -> str:
+    if total <= 0:
+        return "[----------] 0/0 (0%)"
+    filled = int(width * done / max(total, 1))
+    bar = "#" * filled + "-" * (width - filled)
+    pct = int(100 * done / max(total, 1))
+    return f"[{bar}] {done}/{total} ({pct}%)"
+
+
+def progress_line(prefix: str, done: int, total: int, width: int = 30) -> str:
+    return f"{prefix} {render_progress(done, total, width)}"
+
+
+def colorize(text: str, kind: str, use_color: bool) -> str:
+    if not use_color:
+        return text
+    codes = {
+        "info": "\033[36m",
+        "ok": "\033[32m",
+        "warn": "\033[33m",
+        "err": "\033[31m",
+        "reset": "\033[0m",
+    }
+    return f"{codes.get(kind, '')}{text}{codes['reset']}"
+
+
+def adjust_adaptive_limits(
+    progress_state: Dict[str, object],
+    *,
+    direction: str,
+    reason: str,
+    label: str,
+) -> None:
+    if not progress_state.get("adaptive_limits"):
+        return
+    lock: Optional[threading.Lock] = progress_state.get("lock")
+    if lock:
+        lock.acquire()
+    try:
+        max_chars = int(progress_state.get("max_chars", 0) or 0)
+        max_tokens = int(progress_state.get("max_tokens", 0) or 0)
+        min_chars = int(progress_state.get("min_chars", 0) or 0)
+        min_tokens = int(progress_state.get("min_tokens", 0) or 0)
+        max_chars_cap = int(progress_state.get("max_chars_cap", max_chars) or max_chars)
+        max_tokens_cap = int(progress_state.get("max_tokens_cap", max_tokens) or max_tokens)
+        stable = int(progress_state.get("stable_ok", 0) or 0)
+
+        new_chars = max_chars
+        new_tokens = max_tokens
+        if direction == "down":
+            new_chars = max(min_chars, int(max_chars * 0.8))
+            new_tokens = max(min_tokens, int(max_tokens * 0.85))
+            stable = 0
+        elif direction == "up" and stable >= 3:
+            new_chars = min(max_chars_cap, int(max_chars * 1.1))
+            new_tokens = min(max_tokens_cap, int(max_tokens * 1.1))
+            stable = 0
+
+        if new_chars != max_chars or new_tokens != max_tokens:
+            progress_state["max_chars"] = new_chars
+            progress_state["max_tokens"] = new_tokens
+            if progress_state.get("verbose"):
+                print(
+                    f"{label}: ADAPT {direction} -> max_chars={new_chars} max_tokens={new_tokens} "
+                    f"(reason: {reason})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        progress_state["stable_ok"] = stable
+    finally:
+        if lock:
+            lock.release()
 
 
 def force_linebreaks(text: str, target_lines: int) -> str:
@@ -1053,6 +1194,20 @@ def main() -> int:
     ap.add_argument("--attempts", type=int, default=5, help="Retry attempts per request (default: 5)")
     ap.add_argument("--parallel", type=int, default=4,
                     help="Parallel batch requests (default: 4)")
+    ap.add_argument("--progress-bar", action="store_true", default=True,
+                    help="Show progress bar output (default: on)")
+    ap.add_argument("--no-progress-bar", dest="progress_bar", action="store_false",
+                    help="Disable progress bar output")
+    ap.add_argument("--verbose", action="store_true", default=False,
+                    help="Verbose logging (default: off)")
+    ap.add_argument("--adaptive-limits", action="store_true", default=False,
+                    help="Auto-tune max-chars/max-tokens based on response quality (default: off)")
+    ap.add_argument("--no-adaptive-limits", dest="adaptive_limits", action="store_false",
+                    help="Disable auto-tuning of limits")
+    ap.add_argument("--color", action="store_true", default=True,
+                    help="Colorize logs (default: on)")
+    ap.add_argument("--no-color", dest="color", action="store_false",
+                    help="Disable colored logs")
     ap.add_argument("--movies-root", default="/home/h2/media/Movies",
                     help="Root folder to search when input is a tmdb id (default: /home/h2/media/Movies)")
 
@@ -1106,29 +1261,46 @@ def main() -> int:
         if args.resume and progress_path.exists():
             translated_all = load_progress(progress_path)
             if translated_all:
-                print(f"RESUME: loaded {len(translated_all)} segments from {progress_path}")
+                print(colorize(f"RESUME: loaded {len(translated_all)} segments from {progress_path}", "info", args.color))
 
         items = [it for it in items_full if str(it["id"]) not in translated_all or not translated_all.get(str(it["id"]))] 
         if not items:
-            print(f"SKIP all translated: {in_path.name}")
+            print(colorize(f"SKIP all translated: {in_path.name}", "info", args.color))
         else:
-            print(f"{in_path.name}: remaining {len(items)}/{len(items_full)} segments")
+            print(colorize(f"{in_path.name}: remaining {len(items)}/{len(items_full)} segments", "info", args.color))
 
         batches = list(chunk_by_chars(items, max_chars=args.max_chars))
         total_batches = len(batches)
         parallel = max(1, args.parallel)
-        print(
-            f"{in_path.name}: translate {len(items_full)} segments, "
-            f"{total_batches} batches, parallel={parallel}"
-        )
-        print(
-            f"{in_path.name}: a segment = one subtitle block; ids are the SRT numbers; "
-            f"batches group multiple segments per request"
-        )
-        if parallel > 1:
-            print(f"{in_path.name}: note: batch completion logs may appear out of order (parallel)")
+        if args.verbose:
+            print(
+                f"{in_path.name}: translate {len(items_full)} segments, "
+                f"{total_batches} batches, parallel={parallel}"
+            )
+            print(
+                f"{in_path.name}: a segment = one subtitle block; ids are the SRT numbers; "
+                f"batches group multiple segments per request"
+            )
+            if parallel > 1:
+                print(f"{in_path.name}: note: batch completion logs may appear out of order (parallel)")
 
         progress_state: Dict[str, object] = {}
+        progress_state["adaptive_limits"] = args.adaptive_limits
+        progress_state["max_chars"] = args.max_chars
+        progress_state["max_tokens"] = args.max_tokens
+        progress_state["max_chars_cap"] = args.max_chars
+        progress_state["max_tokens_cap"] = args.max_tokens
+        progress_state["min_chars"] = max(500, args.max_chars // 4)
+        progress_state["min_tokens"] = max(256, args.max_tokens // 4)
+        progress_state["stable_ok"] = 0
+        progress_state["verbose"] = args.verbose
+        if parallel > 1:
+            progress_state["lock"] = threading.Lock()
+        total_segments = len(items_full)
+        if args.progress_bar:
+            done = len(translated_all)
+            sys.stdout.write("\r" + progress_line(in_path.name, done, total_segments))
+            sys.stdout.flush()
         if parallel == 1:
             for bi, batch in enumerate(batches, start=1):
                 progress_label = f"{in_path.name}: batch {bi}/{total_batches}"
@@ -1150,7 +1322,12 @@ def main() -> int:
                 translated_all.update(translated)
                 if args.resume:
                     save_progress(progress_path, translated_all)
-                print(f"{in_path.name}: batch {bi}/{total_batches} done, total {len(translated_all)}/{len(items)}")
+                if args.verbose:
+                    print(f"{in_path.name}: batch {bi}/{total_batches} done, total {len(translated_all)}/{len(items)}")
+                if args.progress_bar:
+                    done = len(translated_all)
+                    sys.stdout.write("\r" + progress_line(in_path.name, done, total_segments))
+                    sys.stdout.flush()
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as ex:
                 futures: Dict[concurrent.futures.Future[Dict[str, str]], int] = {}
@@ -1180,15 +1357,22 @@ def main() -> int:
                     translated_all.update(translated)
                     if args.resume:
                         save_progress(progress_path, translated_all)
-                    print(
-                        f"{in_path.name}: batch {bi}/{total_batches} done, "
-                        f"total {len(translated_all)}/{len(items)}"
-                    )
+                    if args.verbose:
+                        print(
+                            f"{in_path.name}: batch {bi}/{total_batches} done, "
+                            f"total {len(translated_all)}/{len(items)}"
+                        )
+                    if args.progress_bar:
+                        done = len(translated_all)
+                        sys.stdout.write("\r" + progress_line(in_path.name, done, total_segments))
+                        sys.stdout.flush()
 
+        if args.progress_bar:
+            sys.stdout.write("\n")
         out_segments = apply_translations(src_segments, translated_all, strip_translator_tag=args.strip_translator_tag)
         out_text = format_srt(out_segments)
         out_path.write_text(out_text, encoding="utf-8")
-        print(f"WROTE: {out_path}")
+        print(colorize(f"WROTE: {out_path}", "ok", args.color))
         if args.resume:
             save_progress(progress_path, translated_all)
 
@@ -1210,7 +1394,12 @@ def main() -> int:
                         flagged_ids.append(str(sid))
 
         if args.validate and heur is not None:
-            print(f"VALIDATE: ok={heur['ok']} total={heur['total_segments']} expected_translations={heur['expected_translations']}")
+            status = "ok" if heur["ok"] else "warn"
+            print(colorize(
+                f"VALIDATE: ok={heur['ok']} total={heur['total_segments']} expected_translations={heur['expected_translations']}",
+                status,
+                args.color,
+            ))
             if not heur["ok"]:
                 type_counts: Dict[str, int] = {}
                 for it in heur["issues"]:
@@ -1220,78 +1409,97 @@ def main() -> int:
                 if type_counts:
                     top = sorted(type_counts.items(), key=lambda x: (-x[1], x[0]))[:6]
                     top_str = ", ".join(f"{k}={v}" for k, v in top)
-                    print(f"  SUMMARY: {top_str}")
+                    print(colorize(f"  SUMMARY: {top_str}", "warn", args.color))
                 for it in heur["issues"][:25]:
-                    print("  ISSUE:", it)
+                    print(colorize(f"  ISSUE: {it}", "warn", args.color))
 
         if args.auto_fix and heur is not None and flagged_ids:
-            unique_ids = sorted(set(flagged_ids), key=lambda x: int(x))
-            sample = ", ".join(unique_ids[:8])
-            print(f"AUTO-FIX: retranslate {len(unique_ids)} segments (e.g. {sample})")
-            items_map = build_items_map_with_context(
-                src_segments,
-                strip_translator_tag=args.strip_translator_tag,
-                context_window=max(0, args.context_window),
-            )
-            fix_items = [items_map[sid] for sid in unique_ids if sid in items_map]
-            if fix_items:
-                fix_max_chars = min(args.max_chars, 2000)
-                fix_max_tokens = min(args.max_tokens, 1024)
-                fix_batches = list(chunk_by_chars(fix_items, max_chars=fix_max_chars))
-                for bi, batch in enumerate(fix_batches, start=1):
-                    progress_label = f"{in_path.name}: autofix batch {bi}/{len(fix_batches)}"
-                    fixed = translate_items_recursive(
-                        api_key=args.api_key,
-                        model=args.model,
-                        target_lang=args.target_lang,
-                        items=batch,
-                        temperature=args.temperature,
-                        max_tokens=fix_max_tokens,
-                        timeout_s=args.timeout,
-                        app_url=args.app_url,
-                        app_title=args.app_title,
-                        response_format=response_format,
-                        attempts=args.attempts,
-                        progress_label=progress_label,
-                    )
-                    translated_all.update(fixed)
-
-                out_segments = apply_translations_with_linebreaks(
+            fix_rounds = 2
+            for round_idx in range(1, fix_rounds + 1):
+                unique_ids = sorted(set(flagged_ids), key=lambda x: int(x))
+                if not unique_ids:
+                    break
+                sample = ", ".join(unique_ids[:8])
+                print(colorize(
+                    f"AUTO-FIX: round {round_idx}/{fix_rounds}, retranslate {len(unique_ids)} segments (e.g. {sample})",
+                    "info",
+                    args.color,
+                ))
+                items_map = build_items_map_with_context(
                     src_segments,
-                    translated_all,
                     strip_translator_tag=args.strip_translator_tag,
-                    enforce_ids=set(unique_ids),
+                    context_window=max(0, args.context_window),
                 )
-                out_text = format_srt(out_segments)
-                out_path.write_text(out_text, encoding="utf-8")
-                print(f"WROTE: {out_path}")
+                fix_items = [items_map[sid] for sid in unique_ids if sid in items_map]
+                if fix_items:
+                    fix_max_chars = min(args.max_chars, 2000)
+                    fix_max_tokens = min(args.max_tokens, 1024)
+                    fix_batches = list(chunk_by_chars(fix_items, max_chars=fix_max_chars))
+                    for bi, batch in enumerate(fix_batches, start=1):
+                        progress_label = f"{in_path.name}: autofix batch {bi}/{len(fix_batches)}"
+                        fixed = translate_items_recursive(
+                            api_key=args.api_key,
+                            model=args.model,
+                            target_lang=args.target_lang,
+                            items=batch,
+                            temperature=args.temperature,
+                            max_tokens=fix_max_tokens,
+                            timeout_s=args.timeout,
+                            app_url=args.app_url,
+                            app_title=args.app_title,
+                            response_format=response_format,
+                            attempts=args.attempts,
+                            progress_label=progress_label,
+                            progress_state=progress_state,
+                        )
+                        translated_all.update(fixed)
 
-                if args.resume:
-                    save_progress(progress_path, translated_all)
-                if args.validate:
-                    heur = validate_translation(
-                        original_segments=src_segments,
-                        translated_segments=out_segments,
-                        translated_ids=set(translated_all.keys()),
-                        target_lang=args.target_lang,
+                    out_segments = apply_translations_with_linebreaks(
+                        src_segments,
+                        translated_all,
                         strip_translator_tag=args.strip_translator_tag,
+                        enforce_ids=set(unique_ids),
                     )
-                    print(
-                        f"AUTO-FIX VALIDATE: ok={heur['ok']} total={heur['total_segments']} "
-                        f"expected_translations={heur['expected_translations']}"
-                    )
-                    if not heur["ok"]:
-                        type_counts = {}
-                        for it in heur["issues"]:
-                            if isinstance(it, dict):
-                                t = str(it.get("type", "unknown"))
-                                type_counts[t] = type_counts.get(t, 0) + 1
-                        if type_counts:
-                            top = sorted(type_counts.items(), key=lambda x: (-x[1], x[0]))[:6]
-                            top_str = ", ".join(f"{k}={v}" for k, v in top)
-                            print(f"  SUMMARY: {top_str}")
-                        for it in heur["issues"][:25]:
-                            print("  ISSUE:", it)
+                    out_text = format_srt(out_segments)
+                    out_path.write_text(out_text, encoding="utf-8")
+                    print(colorize(f"WROTE: {out_path}", "ok", args.color))
+
+                    if args.resume:
+                        save_progress(progress_path, translated_all)
+                    if args.validate:
+                        heur = validate_translation(
+                            original_segments=src_segments,
+                            translated_segments=out_segments,
+                            translated_ids=set(translated_all.keys()),
+                            target_lang=args.target_lang,
+                            strip_translator_tag=args.strip_translator_tag,
+                        )
+                        status = "ok" if heur["ok"] else "warn"
+                        print(colorize(
+                            f"AUTO-FIX VALIDATE: ok={heur['ok']} total={heur['total_segments']} "
+                            f"expected_translations={heur['expected_translations']}",
+                            status,
+                            args.color,
+                        ))
+                        if not heur["ok"]:
+                            type_counts = {}
+                            flagged_ids = []
+                            for it in heur["issues"]:
+                                if isinstance(it, dict):
+                                    t = str(it.get("type", "unknown"))
+                                    type_counts[t] = type_counts.get(t, 0) + 1
+                                    if "id" in it:
+                                        flagged_ids.append(str(it["id"]))
+                            if type_counts:
+                                top = sorted(type_counts.items(), key=lambda x: (-x[1], x[0]))[:6]
+                                top_str = ", ".join(f"{k}={v}" for k, v in top)
+                                print(colorize(f"  SUMMARY: {top_str}", "warn", args.color))
+                            for it in heur["issues"][:25]:
+                                print(colorize(f"  ISSUE: {it}", "warn", args.color))
+                        else:
+                            flagged_ids = []
+                else:
+                    break
 
         if args.resume and progress_path.exists():
             if args.validate and heur is not None and heur.get("ok"):
