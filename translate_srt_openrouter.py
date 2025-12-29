@@ -1176,6 +1176,11 @@ def run_llm_qc(
     app_title: str,
     response_format: Optional[dict],
     attempts: int,
+    parallel: int,
+    progress_bar: bool,
+    progress_label: str,
+    verbose: bool,
+    color: bool,
 ) -> Dict[str, object]:
     src_map: Dict[str, str] = {}
     for s in original_segments:
@@ -1212,21 +1217,70 @@ def run_llm_qc(
         })
 
     results: Dict[str, Dict[str, object]] = {}
-    for batch in chunk_by_chars(qc_items, max_chars=max_chars):
-        out = qc_judge_batch(
-            api_key=api_key,
-            model=judge_model,
-            target_lang=target_lang,
-            batch=batch,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout_s=timeout_s,
-            app_url=app_url,
-            app_title=app_title,
-            response_format=response_format,
-            attempts=attempts,
-        )
-        results.update(out)
+    batches = list(chunk_by_chars(qc_items, max_chars=max_chars))
+    total_batches = len(batches)
+    parallel = max(1, parallel)
+    if verbose:
+        print(colorize(
+            f"{progress_label}: QC {len(qc_items)} segments, {total_batches} batches, parallel={parallel}",
+            "info",
+            color,
+        ))
+    done_batches = 0
+    if progress_bar:
+        sys.stdout.write("\r" + progress_line(f"{progress_label}: qc", done_batches, total_batches))
+        sys.stdout.flush()
+
+    if parallel == 1:
+        for batch in batches:
+            out = qc_judge_batch(
+                api_key=api_key,
+                model=judge_model,
+                target_lang=target_lang,
+                batch=batch,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout_s=timeout_s,
+                app_url=app_url,
+                app_title=app_title,
+                response_format=response_format,
+                attempts=attempts,
+            )
+            results.update(out)
+            done_batches += 1
+            if progress_bar:
+                sys.stdout.write("\r" + progress_line(f"{progress_label}: qc", done_batches, total_batches))
+                sys.stdout.flush()
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as ex:
+            futures: Dict[concurrent.futures.Future[Dict[str, Dict[str, object]]], int] = {}
+            for bi, batch in enumerate(batches, start=1):
+                fut = ex.submit(
+                    qc_judge_batch,
+                    api_key=api_key,
+                    model=judge_model,
+                    target_lang=target_lang,
+                    batch=batch,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout_s=timeout_s,
+                    app_url=app_url,
+                    app_title=app_title,
+                    response_format=response_format,
+                    attempts=attempts,
+                )
+                futures[fut] = bi
+
+            for fut in concurrent.futures.as_completed(futures):
+                out = fut.result()
+                results.update(out)
+                done_batches += 1
+                if progress_bar:
+                    sys.stdout.write("\r" + progress_line(f"{progress_label}: qc", done_batches, total_batches))
+                    sys.stdout.flush()
+
+    if progress_bar:
+        sys.stdout.write("\n")
 
     scores = [v["score"] for v in results.values() if isinstance(v.get("score"), int) and v["score"] > 0]
     avg = sum(scores) / max(len(scores), 1)
@@ -1260,6 +1314,7 @@ def main() -> int:
 
     ap.add_argument("--temperature", type=float, default=0.0, help="Translation temperature (default: 0.0)")
     ap.add_argument("--qc-temperature", type=float, default=0.0, help="QC temperature (default: 0.0)")
+    ap.add_argument("--qc-parallel", type=int, default=1, help="Parallel QC batch requests (default: 1)")
     ap.add_argument("--timeout", type=int, default=120, help="HTTP timeout seconds (default: 120)")
     ap.add_argument("--overwrite", action="store_true", help="Overwrite output file if it exists")
     ap.add_argument("--overwrite-translated", action="store_true",
@@ -1277,8 +1332,10 @@ def main() -> int:
     ap.add_argument("--no-validate", dest="validate", action="store_false",
                     help="Disable heuristic validation")
     ap.add_argument("--llm-qc", action="store_true", help="Run judge-model QC and emit report JSON")
-    ap.add_argument("--qc-limit", type=int, default=250,
-                    help="How many segments to QC (0 = all). Default: 250. Prioritizes flagged segments first.")
+    ap.add_argument("--llm-qc-only", action="store_true",
+                    help="Run judge-model QC on existing translated .srt without translating")
+    ap.add_argument("--qc-limit", type=int, default=10,
+                    help="How many segments to QC (0 = all). Default: 10. Prioritizes flagged segments first.")
     ap.add_argument("--auto-fix", action="store_true", default=True,
                     help="Auto-fix flagged segments (retranslate + linebreak enforcement) (default: on)")
     ap.add_argument("--no-auto-fix", dest="auto_fix", action="store_false",
@@ -1316,6 +1373,9 @@ def main() -> int:
 
     args = ap.parse_args()
 
+    if args.llm_qc_only:
+        args.llm_qc = True
+
     if not args.api_key:
         print("Missing API key. Set OPENROUTER_API_KEY or pass --api-key.", file=sys.stderr)
         return 2
@@ -1351,9 +1411,87 @@ def main() -> int:
 
     response_format = {"type": "json_object"} if args.json_mode else None
 
+    exit_code = 0
     for in_path in in_files:
         out_name = swap_lang_in_filename(in_path.name, args.target_lang)
         out_path = in_path.with_name(out_name)
+
+        if args.llm_qc_only:
+            if not out_path.exists():
+                print(f"QC-only missing translated file: {out_path}", file=sys.stderr)
+                exit_code = 1
+                continue
+            src_text = read_text_with_fallback(in_path)
+            src_segments = parse_srt(src_text)
+            out_text = read_text_with_fallback(out_path)
+            out_segments = parse_srt(out_text)
+            translated_ids = {str(s.num) for s in out_segments if s.timestamp and "".join(s.lines).strip()}
+
+            heur = None
+            flagged_ids: List[str] = []
+            if args.validate or args.llm_qc:
+                heur = validate_translation(
+                    original_segments=src_segments,
+                    translated_segments=out_segments,
+                    translated_ids=translated_ids,
+                    target_lang=args.target_lang,
+                    strip_translator_tag=args.strip_translator_tag,
+                )
+                for it in heur["issues"]:
+                    if isinstance(it, dict) and "id" in it:
+                        flagged_ids.append(str(it["id"]))
+                    if isinstance(it, dict) and it.get("type") == "missing_model_outputs":
+                        for sid in it.get("ids", []):
+                            flagged_ids.append(str(sid))
+
+            if args.validate and heur is not None:
+                status = "ok" if heur["ok"] else "warn"
+                print(colorize(
+                    f"VALIDATE: ok={heur['ok']} total={heur['total_segments']} expected_translations={heur['expected_translations']}",
+                    status,
+                    args.color,
+                ))
+                if not heur["ok"]:
+                    type_counts: Dict[str, int] = {}
+                    for it in heur["issues"]:
+                        if isinstance(it, dict):
+                            t = str(it.get("type", "unknown"))
+                            type_counts[t] = type_counts.get(t, 0) + 1
+                    if type_counts:
+                        top = sorted(type_counts.items(), key=lambda x: (-x[1], x[0]))[:6]
+                        top_str = ", ".join(f"{k}={v}" for k, v in top)
+                        print(colorize(f"  SUMMARY: {top_str}", "warn", args.color))
+                    for it in heur["issues"][:25]:
+                        print(colorize(f"  ISSUE: {it}", "warn", args.color))
+
+            if args.llm_qc:
+                qc = run_llm_qc(
+                    api_key=args.api_key,
+                    judge_model=args.judge_model,
+                    target_lang=args.target_lang,
+                    original_segments=src_segments,
+                    translated_segments=out_segments,
+                    strip_translator_tag=args.strip_translator_tag,
+                    qc_limit=max(0, args.qc_limit),
+                    flagged_ids=flagged_ids,
+                    max_chars=args.max_chars,
+                    temperature=args.qc_temperature,
+                    max_tokens=args.qc_max_tokens,
+                    timeout_s=args.timeout,
+                    app_url=args.app_url,
+                    app_title=args.app_title,
+                    response_format=response_format,
+                    attempts=args.attempts,
+                    parallel=args.qc_parallel,
+                    progress_bar=args.progress_bar,
+                    progress_label=in_path.name,
+                    verbose=args.verbose,
+                    color=args.color,
+                )
+                qc_path = out_path.with_suffix(out_path.suffix + ".qc.json")
+                qc_path.write_text(json.dumps(qc, ensure_ascii=False, indent=2), encoding="utf-8")
+                print(f"QC: avg_score={qc['average_score']} by_score={qc['by_score']} report={qc_path}")
+            continue
 
         if out_path.exists() and not (args.overwrite or args.overwrite_translated):
             print(f"SKIP exists: {out_path}")
@@ -1635,12 +1773,17 @@ def main() -> int:
                 app_title=args.app_title,
                 response_format=response_format,
                 attempts=args.attempts,
+                parallel=args.qc_parallel,
+                progress_bar=args.progress_bar,
+                progress_label=in_path.name,
+                verbose=args.verbose,
+                color=args.color,
             )
             qc_path = out_path.with_suffix(out_path.suffix + ".qc.json")
             qc_path.write_text(json.dumps(qc, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"QC: avg_score={qc['average_score']} by_score={qc['by_score']} report={qc_path}")
 
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

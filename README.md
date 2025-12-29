@@ -22,6 +22,7 @@ python3 translate_srt_openrouter.py 1197137 -t th
 - `--qc-max-tokens`: output tokens for QC.
 - `--temperature`: translation temperature.
 - `--qc-temperature`: QC temperature.
+- `--qc-parallel`: parallel QC batch requests.
 - `--timeout`: HTTP timeout seconds.
 - `--overwrite`, `--overwrite-translated`: overwrite output if exists.
 - `--recursive`: recurse into subfolders when input is a directory.
@@ -29,7 +30,8 @@ python3 translate_srt_openrouter.py 1197137 -t th
 - `--context-window`: include N previous/next segments as context.
 - `--validate`, `--no-validate`: heuristic validation.
 - `--llm-qc`: run judge model QC and save report JSON.
-- `--qc-limit`: QC segment limit (0 = all).
+- `--llm-qc-only`: run judge QC on existing translated `.srt` without translating.
+- `--qc-limit`: QC segment limit (0 = all). Default: 10.
 - `--auto-fix`, `--no-auto-fix`: auto-fix flagged segments.
 - `--resume`, `--no-resume`: save/load progress file.
 - `--app-url`: HTTP-Referer header for OpenRouter.
@@ -85,6 +87,10 @@ Use cases:
 - Auto translate a movie folder by TMDB id and resume safely:
 ```bash
 python3 translate_srt_openrouter.py 1197137 -t th
+```
+- Run judge-only QC on an existing translation:
+```bash
+python3 translate_srt_openrouter.py 1197137 -t th --llm-qc-only --qc-limit 10
 ```
 - Overwrite an existing translated file:
 ```bash
