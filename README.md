@@ -27,6 +27,7 @@ python3 translate_srt_openrouter.py 1197137 -t th
 - `--verbose`: print detailed batch/missing logs.
 - `--no-color`: disable colored logs.
 - `--movies-root`: override TMDB lookup root.
+- Auto-extract: if no English `.srt` is found in a directory/TMDB folder, the script uses `ffprobe/ffmpeg` to extract an English subtitle stream when available.
 
 ### Examples
 Translate a file:
