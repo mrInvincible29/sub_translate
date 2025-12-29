@@ -26,7 +26,7 @@ import concurrent.futures
 import threading
 import subprocess
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -308,6 +308,7 @@ def openrouter_chat(
     app_url: str,
     app_title: str,
     response_format: Optional[dict],
+    stats: Optional["RequestStats"],
 ) -> dict:
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -328,9 +329,131 @@ def openrouter_chat(
     if response_format is not None:
         payload["response_format"] = response_format
 
-    r = requests.post(OPENROUTER_CHAT_URL, headers=headers, json=payload, timeout=timeout_s)
-    r.raise_for_status()
-    return r.json()
+    if stats:
+        stats.record_attempt()
+    try:
+        r = requests.post(OPENROUTER_CHAT_URL, headers=headers, json=payload, timeout=timeout_s)
+        r.raise_for_status()
+        data = r.json()
+        if stats:
+            stats.record_success(data)
+        return data
+    except Exception:
+        if stats:
+            stats.record_failure()
+        raise
+
+
+@dataclass
+class RequestStats:
+    total_requests: int = 0
+    successful_requests: int = 0
+    failed_attempts: int = 0
+    retries: int = 0
+    json_errors: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    total_cost: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def _to_int(self, val: object) -> int:
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return 0
+
+    def _to_float(self, val: object) -> float:
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def record_attempt(self) -> None:
+        with self.lock:
+            self.total_requests += 1
+
+    def record_success(self, resp: dict) -> None:
+        usage = resp.get("usage") or {}
+        prompt = usage.get("prompt_tokens", usage.get("input_tokens"))
+        completion = usage.get("completion_tokens", usage.get("output_tokens"))
+        total = usage.get("total_tokens")
+        cost = usage.get("total_cost", usage.get("cost", resp.get("cost")))
+
+        with self.lock:
+            self.successful_requests += 1
+            if prompt is not None:
+                self.prompt_tokens += self._to_int(prompt)
+            if completion is not None:
+                self.completion_tokens += self._to_int(completion)
+            if total is not None:
+                self.total_tokens += self._to_int(total)
+            elif prompt is not None or completion is not None:
+                self.total_tokens += self._to_int(prompt) + self._to_int(completion)
+            if cost is not None:
+                self.total_cost += self._to_float(cost)
+
+    def record_failure(self) -> None:
+        with self.lock:
+            self.failed_attempts += 1
+
+    def record_retry(self) -> None:
+        with self.lock:
+            self.retries += 1
+
+    def record_json_error(self) -> None:
+        with self.lock:
+            self.json_errors += 1
+
+    def snapshot(self) -> Dict[str, object]:
+        with self.lock:
+            return {
+                "total_requests": self.total_requests,
+                "successful_requests": self.successful_requests,
+                "failed_attempts": self.failed_attempts,
+                "retries": self.retries,
+                "json_errors": self.json_errors,
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+                "total_tokens": self.total_tokens,
+                "total_cost": self.total_cost,
+            }
+
+
+def stats_delta(after: Dict[str, object], before: Dict[str, object]) -> Dict[str, object]:
+    out: Dict[str, object] = {}
+    for k, v in after.items():
+        if isinstance(v, (int, float)) and isinstance(before.get(k), (int, float)):
+            out[k] = v - before.get(k, 0)
+        else:
+            out[k] = v
+    return out
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:d}:{s:02d}"
+
+
+def format_stats(stats: Dict[str, object], duration_s: float) -> str:
+    cost = float(stats.get("total_cost") or 0.0)
+    return (
+        f"time={format_duration(duration_s)} "
+        f"requests={int(stats.get('total_requests', 0))} "
+        f"ok={int(stats.get('successful_requests', 0))} "
+        f"failed={int(stats.get('failed_attempts', 0))} "
+        f"retries={int(stats.get('retries', 0))} "
+        f"json_errors={int(stats.get('json_errors', 0))} "
+        f"prompt_toks={int(stats.get('prompt_tokens', 0))} "
+        f"completion_toks={int(stats.get('completion_tokens', 0))} "
+        f"total_toks={int(stats.get('total_tokens', 0))} "
+        f"cost_usd={cost:.6f}"
+    )
 
 
 def translate_batch(
@@ -348,6 +471,7 @@ def translate_batch(
     attempts: int,
     progress_label: str,
     progress_state: Optional[Dict[str, object]],
+    stats: Optional[RequestStats],
 ) -> Dict[str, str]:
     target_name = TARGET_LANG_NAMES.get(target_lang, target_lang)
     req_obj = {"target_language": target_lang, "segments": batch}
@@ -358,6 +482,8 @@ def translate_batch(
 
     last_err: Optional[Exception] = None
     for attempt in range(attempts):
+        if attempt > 0 and stats:
+            stats.record_retry()
         try:
             if progress_state is None or progress_state.get("verbose"):
                 print(f"{progress_label}: request attempt {attempt + 1}/{attempts}...", flush=True)
@@ -371,6 +497,7 @@ def translate_batch(
                 app_url=app_url,
                 app_title=app_title,
                 response_format=response_format,
+                stats=stats,
             )
             content = resp["choices"][0]["message"]["content"]
             try:
@@ -385,6 +512,8 @@ def translate_batch(
                     progress_state["last_salvaged"] = False
                 return out
             except json.JSONDecodeError as e:
+                if stats:
+                    stats.record_json_error()
                 if progress_state is not None:
                     progress_state["last_json_error"] = True
                 best = extract_segments_best_effort(content or "")
@@ -432,6 +561,7 @@ def translate_items_recursive(
     progress_label: str,
     depth: int = 0,
     progress_state: Optional[Dict[str, object]] = None,
+    stats: Optional[RequestStats] = None,
 ) -> Dict[str, str]:
     if not items:
         return {}
@@ -482,6 +612,7 @@ def translate_items_recursive(
             attempts=attempts,
             progress_label=progress_label,
             progress_state=progress_state,
+            stats=stats,
         )
     except json.JSONDecodeError:
         if len(items) == 1:
@@ -507,6 +638,7 @@ def translate_items_recursive(
             progress_label=f"{progress_label} [split L]",
             depth=depth + 1,
             progress_state=progress_state,
+            stats=stats,
         )
         right = translate_items_recursive(
             api_key=api_key, model=model, target_lang=target_lang, items=items[mid:],
@@ -515,6 +647,7 @@ def translate_items_recursive(
             progress_label=f"{progress_label} [split R]",
             depth=depth + 1,
             progress_state=progress_state,
+            stats=stats,
         )
         left.update(right)
         return left
@@ -602,6 +735,7 @@ def translate_items_recursive(
         progress_label=f"{progress_label} [split L]",
         depth=depth + 1,
         progress_state=progress_state,
+        stats=stats,
     )
     right = translate_items_recursive(
         api_key=api_key, model=model, target_lang=target_lang, items=items[mid:],
@@ -610,6 +744,7 @@ def translate_items_recursive(
         progress_label=f"{progress_label} [split R]",
         depth=depth + 1,
         progress_state=progress_state,
+        stats=stats,
     )
     left.update(right)
     return left
@@ -1077,6 +1212,7 @@ def qc_judge_batch(
     app_title: str,
     response_format: Optional[dict],
     attempts: int,
+    stats: Optional[RequestStats],
 ) -> Dict[str, Dict[str, object]]:
     target_name = TARGET_LANG_NAMES.get(target_lang, target_lang)
     req_obj = {"target_language": target_lang, "segments": batch}
@@ -1087,6 +1223,8 @@ def qc_judge_batch(
 
     last_err: Optional[Exception] = None
     for attempt in range(attempts):
+        if attempt > 0 and stats:
+            stats.record_retry()
         try:
             resp = openrouter_chat(
                 api_key=api_key,
@@ -1098,12 +1236,15 @@ def qc_judge_batch(
                 app_url=app_url,
                 app_title=app_title,
                 response_format=response_format,
+                stats=stats,
             )
             content = resp["choices"][0]["message"]["content"]
             try:
                 obj = safe_json_loads(content)
             except json.JSONDecodeError as e:
                 snippet = (content or "").replace("\n", " ")[:160]
+                if stats:
+                    stats.record_json_error()
                 raise json.JSONDecodeError(
                     f"{e.msg} (content_len={len(content or '')}, snippet={snippet!r})",
                     e.doc,
@@ -1181,6 +1322,7 @@ def run_llm_qc(
     progress_label: str,
     verbose: bool,
     color: bool,
+    stats: Optional[RequestStats],
 ) -> Dict[str, object]:
     src_map: Dict[str, str] = {}
     for s in original_segments:
@@ -1245,6 +1387,7 @@ def run_llm_qc(
                 app_title=app_title,
                 response_format=response_format,
                 attempts=attempts,
+                stats=stats,
             )
             results.update(out)
             done_batches += 1
@@ -1268,6 +1411,7 @@ def run_llm_qc(
                     app_title=app_title,
                     response_format=response_format,
                     attempts=attempts,
+                    stats=stats,
                 )
                 futures[fut] = bi
 
@@ -1411,8 +1555,13 @@ def main() -> int:
 
     response_format = {"type": "json_object"} if args.json_mode else None
 
+    stats_total = RequestStats()
+    run_start = time.time()
+
     exit_code = 0
     for in_path in in_files:
+        file_start = time.time()
+        file_stats_before = stats_total.snapshot()
         out_name = swap_lang_in_filename(in_path.name, args.target_lang)
         out_path = in_path.with_name(out_name)
 
@@ -1420,6 +1569,9 @@ def main() -> int:
             if not out_path.exists():
                 print(f"QC-only missing translated file: {out_path}", file=sys.stderr)
                 exit_code = 1
+                file_stats_after = stats_total.snapshot()
+                delta = stats_delta(file_stats_after, file_stats_before)
+                print(colorize(f"STATS: {format_stats(delta, time.time() - file_start)}", "info", args.color))
                 continue
             src_text = read_text_with_fallback(in_path)
             src_segments = parse_srt(src_text)
@@ -1487,14 +1639,21 @@ def main() -> int:
                     progress_label=in_path.name,
                     verbose=args.verbose,
                     color=args.color,
+                    stats=stats_total,
                 )
                 qc_path = out_path.with_suffix(out_path.suffix + ".qc.json")
                 qc_path.write_text(json.dumps(qc, ensure_ascii=False, indent=2), encoding="utf-8")
                 print(f"QC: avg_score={qc['average_score']} by_score={qc['by_score']} report={qc_path}")
+            file_stats_after = stats_total.snapshot()
+            delta = stats_delta(file_stats_after, file_stats_before)
+            print(colorize(f"STATS: {format_stats(delta, time.time() - file_start)}", "info", args.color))
             continue
 
         if out_path.exists() and not (args.overwrite or args.overwrite_translated):
             print(f"SKIP exists: {out_path}")
+            file_stats_after = stats_total.snapshot()
+            delta = stats_delta(file_stats_after, file_stats_before)
+            print(colorize(f"STATS: {format_stats(delta, time.time() - file_start)}", "info", args.color))
             continue
 
         src_text = read_text_with_fallback(in_path)
@@ -1568,6 +1727,7 @@ def main() -> int:
                     attempts=args.attempts,
                     progress_label=progress_label,
                     progress_state=progress_state,
+                    stats=stats_total,
                 )
                 translated_all.update(translated)
                 if args.resume:
@@ -1598,6 +1758,7 @@ def main() -> int:
                         attempts=args.attempts,
                         progress_label=progress_label,
                         progress_state=progress_state,
+                        stats=stats_total,
                     )
                     futures[fut] = bi
 
@@ -1701,6 +1862,7 @@ def main() -> int:
                             attempts=args.attempts,
                             progress_label=progress_label,
                             progress_state=progress_state,
+                            stats=stats_total,
                         )
                         translated_all.update(fixed)
 
@@ -1778,11 +1940,18 @@ def main() -> int:
                 progress_label=in_path.name,
                 verbose=args.verbose,
                 color=args.color,
+                stats=stats_total,
             )
             qc_path = out_path.with_suffix(out_path.suffix + ".qc.json")
             qc_path.write_text(json.dumps(qc, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"QC: avg_score={qc['average_score']} by_score={qc['by_score']} report={qc_path}")
 
+        file_stats_after = stats_total.snapshot()
+        delta = stats_delta(file_stats_after, file_stats_before)
+        print(colorize(f"STATS: {format_stats(delta, time.time() - file_start)}", "info", args.color))
+
+    total_delta = stats_total.snapshot()
+    print(colorize(f"TOTAL STATS: {format_stats(total_delta, time.time() - run_start)}", "info", args.color))
     return exit_code
 
 
