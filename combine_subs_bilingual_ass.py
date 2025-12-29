@@ -127,7 +127,7 @@ def ass_escape(text: str) -> str:
     return "".join(out)
 
 
-def html_to_ass(text: str) -> str:
+def html_to_ass(text: str, *, allow_color_override: bool) -> str:
     # Basic HTML tag conversion for common subtitle tags.
     text = re.sub(r"<i>", r"{\\i1}", text, flags=re.IGNORECASE)
     text = re.sub(r"</i>", r"{\\i0}", text, flags=re.IGNORECASE)
@@ -135,19 +135,21 @@ def html_to_ass(text: str) -> str:
     text = re.sub(r"</b>", r"{\\b0}", text, flags=re.IGNORECASE)
     text = re.sub(r"<u>", r"{\\u1}", text, flags=re.IGNORECASE)
     text = re.sub(r"</u>", r"{\\u0}", text, flags=re.IGNORECASE)
-    text = re.sub(r"<\s*an([1-9])\s*>", r"{\\an\1}", text, flags=re.IGNORECASE)
-    text = re.sub(r"<\s*\\an([1-9])\s*>", r"{\\an\1}", text, flags=re.IGNORECASE)
+    # Strip alignment overrides to keep bottom placement consistent.
+    text = re.sub(r"<\s*an[1-9]\s*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\s*\\an[1-9]\s*>", "", text, flags=re.IGNORECASE)
 
     def font_tag_repl(match: re.Match) -> str:
         attrs = match.group(1) or ""
         parts: List[str] = []
-        color = re.search(r'color\s*=\s*"(#?[0-9A-Fa-f]{6})"', attrs)
-        if color:
-            hexval = color.group(1).lstrip("#")
-            bb = hexval[4:6]
-            gg = hexval[2:4]
-            rr = hexval[0:2]
-            parts.append(rf"{{\c&H{bb}{gg}{rr}&}}")
+        if allow_color_override:
+            color = re.search(r'color\s*=\s*"(#?[0-9A-Fa-f]{6})"', attrs)
+            if color:
+                hexval = color.group(1).lstrip("#")
+                bb = hexval[4:6]
+                gg = hexval[2:4]
+                rr = hexval[0:2]
+                parts.append(rf"{{\c&H{bb}{gg}{rr}&}}")
         face = re.search(r'face\s*=\s*"([^"]+)"', attrs)
         if face:
             parts.append(rf"{{\fn{face.group(1)}}}")
@@ -179,8 +181,8 @@ def combine_to_ass(a_segs: List[Segment], b_segs: List[Segment]) -> List[str]:
         start_srt, end_srt = parse_srt_timestamp(s.timestamp)
         start = srt_to_ass_time(start_srt)
         end = srt_to_ass_time(end_srt)
-        a_text = ass_escape(html_to_ass("\n".join(s.lines).strip()))
-        b_text = ass_escape(html_to_ass("\n".join(b.lines).strip()))
+        a_text = ass_escape(html_to_ass("\n".join(s.lines).strip(), allow_color_override=False))
+        b_text = ass_escape(html_to_ass("\n".join(b.lines).strip(), allow_color_override=False))
         if a_text:
             events.append(f"Dialogue: 0,{start},{end},A,,0,0,0,,{a_text}")
         if b_text:
