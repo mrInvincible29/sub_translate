@@ -24,6 +24,8 @@ import sys
 import time
 import concurrent.futures
 import threading
+import subprocess
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -850,6 +852,106 @@ def pick_english_srt(dir_path: Path) -> List[Path]:
     return en
 
 
+def list_video_files(dir_path: Path) -> List[Path]:
+    exts = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".m2ts"}
+    return [p for p in sorted(dir_path.iterdir()) if p.suffix.lower() in exts and p.is_file()]
+
+
+def require_ffmpeg_tools() -> None:
+    missing = []
+    if not shutil.which("ffmpeg"):
+        missing.append("ffmpeg")
+    if not shutil.which("ffprobe"):
+        missing.append("ffprobe")
+    if missing:
+        hint = "Install with: sudo apt install ffmpeg"
+        raise FileNotFoundError(f"Missing tools: {', '.join(missing)}. {hint}")
+
+
+def ffprobe_subtitle_streams(video_path: Path) -> List[Dict[str, str]]:
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "s",
+        "-show_entries", "stream=index:stream_tags=language,title:stream=codec_name",
+        "-of", "json",
+        str(video_path),
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    data = json.loads(res.stdout or "{}")
+    streams = []
+    for s in data.get("streams", []):
+        tags = s.get("tags") or {}
+        streams.append({
+            "index": str(s.get("index")),
+            "language": str(tags.get("language", "")),
+            "title": str(tags.get("title", "")),
+            "codec": str(s.get("codec_name", "")),
+        })
+    return streams
+
+
+def pick_stream_interactive(streams: List[Dict[str, str]], prompt: str) -> Dict[str, str]:
+    for i, s in enumerate(streams, start=1):
+        lang = s.get("language", "")
+        title = s.get("title", "")
+        codec = s.get("codec", "")
+        print(f"{i}) index={s['index']} lang={lang} codec={codec} title={title}")
+    while True:
+        sel = input(prompt).strip()
+        if not sel.isdigit():
+            print("Enter a number from the list.")
+            continue
+        idx = int(sel)
+        if 1 <= idx <= len(streams):
+            return streams[idx - 1]
+        print("Invalid selection.")
+
+
+def extract_english_srt_from_dir(dir_path: Path) -> Path:
+    require_ffmpeg_tools()
+    videos = list_video_files(dir_path)
+    if not videos:
+        raise FileNotFoundError(f"No video files found in {dir_path}")
+    if len(videos) > 1:
+        print("Multiple video files found:")
+        for i, v in enumerate(videos, start=1):
+            print(f"{i}) {v.name}")
+        while True:
+            sel = input("Select video to extract EN subtitles from: ").strip()
+            if not sel.isdigit():
+                print("Enter a number from the list.")
+                continue
+            idx = int(sel)
+            if 1 <= idx <= len(videos):
+                video = videos[idx - 1]
+                break
+            print("Invalid selection.")
+    else:
+        video = videos[0]
+
+    streams = ffprobe_subtitle_streams(video)
+    en_streams = [s for s in streams if s.get("language", "").lower() in {"en", "eng"}]
+    if not en_streams:
+        raise FileNotFoundError(f"No English subtitle streams found in {video.name}")
+    if len(en_streams) > 1:
+        print("Multiple English subtitle streams found:")
+        chosen = pick_stream_interactive(en_streams, "Select EN subtitle stream: ")
+    else:
+        chosen = en_streams[0]
+
+    out_path = dir_path / (video.stem + ".en.srt")
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(video),
+        "-map", f"0:{chosen['index']}",
+        "-c:s", "srt",
+        str(out_path),
+    ]
+    subprocess.run(cmd, check=True)
+    return out_path
+
+
 def resolve_tmdb_input(tmdb_id: str, movies_root: Path) -> List[Path]:
     if not tmdb_id.isdigit():
         raise FileNotFoundError(tmdb_id)
@@ -861,7 +963,8 @@ def resolve_tmdb_input(tmdb_id: str, movies_root: Path) -> List[Path]:
     target_dir = sorted(candidates)[0]
     en = pick_english_srt(target_dir)
     if not en:
-        raise FileNotFoundError(f"No English .srt found in {target_dir}")
+        extracted = extract_english_srt_from_dir(target_dir)
+        return [extracted]
     return en
 
 
@@ -1230,7 +1333,16 @@ def main() -> int:
         if raw.isdigit():
             inputs.extend(str(p) for p in resolve_tmdb_input(raw, movies_root))
         else:
-            inputs.append(raw)
+            p = Path(raw).expanduser()
+            if p.is_dir():
+                en = pick_english_srt(p)
+                if not en:
+                    extracted = extract_english_srt_from_dir(p)
+                    inputs.append(str(extracted))
+                else:
+                    inputs.append(raw)
+            else:
+                inputs.append(raw)
 
     in_files = iter_input_files(inputs, recursive=args.recursive)
     if not in_files:
